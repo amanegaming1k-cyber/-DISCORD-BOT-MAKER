@@ -1,0 +1,13 @@
+services:
+
+- type: web
+  name: ag-discord-bot-maker
+  runtime: python
+  plan: free
+  buildCommand: pip install -r requirements.txt
+  startCommand: python bot.py
+  envVars:
+  - key: DISCORD_TOKEN
+    sync: false
+  - key: GUILD_ID
+    sync: false
