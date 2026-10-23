@@ -1,560 +1,681 @@
+
 import os
 import asyncio
-from datetime import timedelta, datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from threading import Thread
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
-from threading import Thread
 
-==============================
-
-AG BOT MAKER - CONFIGURATION
-
-==============================
+# ==========================================
+# AG BOT MAKER - CONFIGURATION
+# ==========================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 
 BOT_NAME = "AG BOT MAKER"
-WELCOME_CHANNEL_NAME = "welcome"
-LOG_CHANNEL_NAME = "mod-logs"
+BOT_VERSION = "2.0.0"
+
+# ==========================================
+# RENDER HEALTH CHECK
+# ==========================================
+
+app = Flask(__name__)
+
+
+@app.get("/")
+def home():
+    return jsonify({
+        "service": BOT_NAME,
+        "status": "running",
+        "version": BOT_VERSION
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# ==========================================
+# DISCORD BOT SETUP
+# ==========================================
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
 
-Demo warning storage: resets when the bot restarts.
+# In-memory warning storage
+warnings_db = defaultdict(list)
 
-warnings_store = defaultdict(list)
-
-Basic anti-spam tracking, held in memory.
-
+# Anti-spam tracking
 message_history = defaultdict(deque)
 SPAM_LIMIT = 6
 SPAM_WINDOW = 8
 
-==============================
 
-HEALTH CHECK FOR RENDER
+# ==========================================
+# RESPONSE HELPER
+# ==========================================
 
-==============================
-
-app = Flask(name)
-
-@app.get("/")
-def home():
-return jsonify({
-"service": BOT_NAME,
-"status": "running"
-})
-
-@app.get("/health")
-def health():
-return jsonify({"status": "ok"})
-
-def run_web_server():
-port = int(os.environ.get("PORT", "10000"))
-app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-==============================
-
-HELPERS
-
-==============================
-
-async def get_text_channel(guild, channel_name):
-channel = discord.utils.get(
-guild.text_channels,
-name=channel_name
-)
-return channel
-
-async def send_mod_log(guild, message):
-channel = await get_text_channel(guild, LOG_CHANNEL_NAME)
-if channel:
-try:
-await channel.send(message)
-except discord.HTTPException:
-pass
-
-def is_moderator():
-async def predicate(interaction: discord.Interaction):
-if not interaction.guild or not isinstance(interaction.user, discord.Member):
-raise app_commands.CheckFailure(
-"এই কমান্ড শুধু সার্ভারে ব্যবহার করা যাবে।"
-)
-
-    if not (
-        interaction.user.guild_permissions.manage_messages
-        or interaction.user.guild_permissions.moderate_members
-        or interaction.user.guild_permissions.administrator
-    ):
-        raise app_commands.CheckFailure(
-            "এই কমান্ড ব্যবহারের জন্য Moderator permission প্রয়োজন।"
+async def respond(
+    interaction: discord.Interaction,
+    message=None,
+    ephemeral=True,
+    **kwargs
+):
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            content=message,
+            ephemeral=ephemeral,
+            **kwargs
         )
+    else:
+        await interaction.response.send_message(
+            content=message,
+            ephemeral=ephemeral,
+            **kwargs
+        )
+
+
+def make_embed(title, description, color=discord.Color.blurple()):
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=f"{BOT_NAME} • v{BOT_VERSION}")
+    return embed
+
+
+def bot_can_moderate(member: discord.Member, target: discord.Member):
+    if target.id == member.guild.owner_id:
+        return False
+
+    if target.id == member.id:
+        return False
+
+    if target.top_role >= member.top_role:
+        return False
 
     return True
 
-return app_commands.check(predicate)
 
-async def respond(interaction, message, ephemeral=True):
-if interaction.response.is_done():
-await interaction.followup.send(message, ephemeral=ephemeral)
-else:
-await interaction.response.send_message(message, ephemeral=ephemeral)
-
-==============================
-
-BOT EVENTS
-
-==============================
+# ==========================================
+# BOT EVENTS
+# ==========================================
 
 @bot.event
 async def on_ready():
-print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-try:
-    if GUILD_ID.isdigit():
-        guild = discord.Object(id=int(GUILD_ID))
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
-    else:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} global commands")
-except Exception as exc:
-    print(f"Command sync failed: {exc}")
-
-await bot.change_presence(
-    activity=discord.Activity(
-        type=discord.ActivityType.watching,
-        name="AG ANIME UNIVERSE"
-    )
-)
-
-@bot.event
-async def on_member_join(member):
-channel = await get_text_channel(
-member.guild,
-WELCOME_CHANNEL_NAME
-)
-
-if channel:
-    embed = discord.Embed(
-        title="Welcome to AG ANIME UNIVERSE!",
-        description=(
-            f"Hello {member.mention}!\n"
-            "Welcome to our anime community. Please read the rules."
-        ),
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=BOT_NAME)
+    print("=" * 40)
+    print(f"{BOT_NAME} is online!")
+    print(f"Logged in as: {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print(f"Discord.py: {discord.__version__}")
+    print("=" * 40)
 
     try:
+        if GUILD_ID:
+            guild_object = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild_object)
+            synced = await bot.tree.sync(guild=guild_object)
+            print(f"Guild commands synced: {len(synced)}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Global commands synced: {len(synced)}")
+    except Exception as error:
+        print(f"Command sync error: {error}")
+
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="AG ANIME UNIVERSE"
+        )
+    )
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+
+    channel = discord.utils.get(
+        member.guild.text_channels,
+        name="welcome"
+    )
+
+    if channel:
+        embed = make_embed(
+            "Welcome to the server!",
+            f"Welcome {member.mention} to **{member.guild.name}**!\n"
+            f"You are member **#{member.guild.member_count}**."
+        )
+
+        if member.guild.icon:
+            embed.set_thumbnail(url=member.guild.icon.url)
+
         await channel.send(embed=embed)
-    except discord.HTTPException:
-        pass
+
 
 @bot.event
-async def on_message(message):
-if message.author.bot or not message.guild:
-return
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
 
-# Basic anti-spam: deletes repeated rapid messages.
-now = asyncio.get_running_loop().time()
-history = message_history[message.author.id]
+    # Basic anti-spam
+    now = datetime.now(timezone.utc)
+    history = message_history[message.author.id]
 
-while history and now - history[0] > SPAM_WINDOW:
-    history.popleft()
+    while history and (now - history[0]).total_seconds() > SPAM_WINDOW:
+        history.popleft()
 
-history.append(now)
+    history.append(now)
 
-if len(history) >= SPAM_LIMIT:
-    try:
-        await message.delete()
-    except discord.HTTPException:
-        pass
-
-    if isinstance(message.author, discord.Member):
-        if message.author.guild_permissions.manage_messages:
-            return
+    if len(history) >= SPAM_LIMIT:
+        history.clear()
 
         try:
-            await message.author.timeout(
-                timedelta(seconds=60),
-                reason="Automatic anti-spam"
-            )
-            await send_mod_log(
-                message.guild,
-                f"Anti-spam: timed out {message.author.mention} for 60 seconds."
-            )
-        except (discord.Forbidden, discord.HTTPException):
+            await message.delete()
+        except discord.HTTPException:
             pass
 
-    history.clear()
-    return
+        if message.channel.permissions_for(
+            message.guild.me
+        ).manage_messages:
+            try:
+                await message.channel.send(
+                    f"{message.author.mention}, please slow down.",
+                    delete_after=5
+                )
+            except discord.HTTPException:
+                pass
 
-await bot.process_commands(message)
+    await bot.process_commands(message)
 
-==============================
 
-BASIC COMMANDS
+@bot.event
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You do not have permission to use this command."
 
-==============================
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        message = "I am missing the required permissions."
+
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Please wait {error.retry_after:.1f} seconds."
+
+    else:
+        original = getattr(error, "original", error)
+        print(f"Slash command error: {original}")
+        message = "An error occurred while running this command."
+
+    try:
+        await respond(interaction, message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+# ==========================================
+# BASIC COMMANDS
+# ==========================================
 
 @bot.tree.command(name="ping", description="Check bot response time")
 async def ping(interaction: discord.Interaction):
-latency = round(bot.latency * 1000)
-await respond(interaction, f"Pong! 🏓 {latency} ms")
+    latency = round(bot.latency * 1000)
+    embed = make_embed(
+        "Pong!",
+        f"**Latency:** {latency} ms\n"
+        f"**Status:** Online",
+        discord.Color.green()
+    )
+    await respond(interaction, embed=embed)
+
 
 @bot.tree.command(name="botinfo", description="Show bot information")
 async def botinfo(interaction: discord.Interaction):
-embed = discord.Embed(
-title=BOT_NAME,
-description="Community management bot",
-color=discord.Color.blurple()
-)
-embed.add_field(name="Servers", value=str(len(bot.guilds)))
-embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)} ms")
-embed.set_footer(text="AG BOT MAKER")
+    embed = make_embed(
+        "AG BOT MAKER",
+        f"**Version:** {BOT_VERSION}\n"
+        f"**Library:** discord.py\n"
+        f"**Servers:** {len(bot.guilds)}\n"
+        f"**Latency:** {round(bot.latency * 1000)} ms\n"
+        f"**Status:** Online",
+        discord.Color.blue()
+    )
 
-await respond(interaction, embed=embed)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
 
-@bot.tree.command(name="serverinfo", description="Show this server's information")
+    await respond(interaction, embed=embed)
+
+
+@bot.tree.command(name="serverinfo", description="Show server information")
+@app_commands.guild_only()
 async def serverinfo(interaction: discord.Interaction):
-guild = interaction.guild
+    guild = interaction.guild
 
-if not guild:
-    await respond(interaction, "এই কমান্ড সার্ভারে ব্যবহার করুন।")
-    return
+    embed = make_embed(
+        f"{guild.name} - Server Info",
+        f"**Members:** {guild.member_count}\n"
+        f"**Text channels:** {len(guild.text_channels)}\n"
+        f"**Voice channels:** {len(guild.voice_channels)}\n"
+        f"**Roles:** {len(guild.roles)}\n"
+        f"**Created:** <t:{int(guild.created_at.timestamp())}:D>",
+        discord.Color.blue()
+    )
 
-embed = discord.Embed(
-    title=guild.name,
-    color=discord.Color.blurple()
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    await respond(interaction, embed=embed)
+
+
+@bot.tree.command(name="help", description="Show available commands")
+async def help_command(interaction: discord.Interaction):
+    embed = make_embed(
+        "AG BOT MAKER - Commands",
+        "**General**\n"
+        "`/ping` — Check bot latency\n"
+        "`/botinfo` — Bot information\n"
+        "`/serverinfo` — Server information\n"
+        "`/help` — Show this help\n\n"
+        "**Setup**\n"
+        "`/setup` — Create basic server channels\n\n"
+        "**Moderation**\n"
+        "`/warn` — Warn a member\n"
+        "`/warnings` — View warnings\n"
+        "`/clearwarnings` — Clear warnings\n"
+        "`/timeout` — Timeout a member\n"
+        "`/kick` — Kick a member\n"
+        "`/ban` — Ban a member\n"
+        "`/clear` — Delete messages",
+        discord.Color.purple()
+    )
+
+    await respond(interaction, embed=embed)
+
+
+# ==========================================
+# SERVER SETUP COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="setup",
+    description="Create basic community channels and categories"
 )
-embed.add_field(name="Members", value=str(guild.member_count or "Unknown"))
-embed.add_field(name="Text channels", value=str(len(guild.text_channels)))
-embed.add_field(name="Roles", value=str(len(guild.roles)))
-embed.set_thumbnail(url=guild.icon.url if guild.icon else discord.Embed.Empty)
-
-await respond(interaction, embed=embed)
-
-==============================
-
-AUTOMATIC SERVER SETUP
-
-==============================
-
-@bot.tree.command(name="setup", description="Create basic community channels and roles")
-@app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_channels=True)
 async def setup(interaction: discord.Interaction):
-await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
 
-guild = interaction.guild
-created = []
-
-# Roles
-role_specs = [
-    ("Admin", discord.Color.red()),
-    ("Moderator", discord.Color.orange()),
-    ("Anime Fan", discord.Color.blurple()),
-    ("Member", discord.Color.green()),
-]
-
-for role_name, color in role_specs:
-    if not discord.utils.get(guild.roles, name=role_name):
-        try:
-            await guild.create_role(
-                name=role_name,
-                color=color,
-                reason=f"{BOT_NAME} setup"
-            )
-            created.append(f"Role: {role_name}")
-        except discord.Forbidden:
-            created.append(f"Could not create role: {role_name}")
-
-# Categories and channels
-category_specs = {
-    "INFORMATION": [
-        "welcome",
-        "rules",
-        "announcements"
-    ],
-    "COMMUNITY": [
-        "general-chat",
-        "anime-discussion",
-        "bot-commands"
-    ],
-    "STAFF": [
-        "mod-logs"
-    ]
-}
-
-for category_name, channel_names in category_specs.items():
-    category = discord.utils.get(
-        guild.categories,
-        name=category_name
-    )
-
-    if not category:
-        try:
-            category = await guild.create_category(
-                category_name,
-                reason=f"{BOT_NAME} setup"
-            )
-            created.append(f"Category: {category_name}")
-        except discord.Forbidden:
-            created.append(f"Could not create category: {category_name}")
-            continue
-
-    for channel_name in channel_names:
-        if discord.utils.get(guild.text_channels, name=channel_name):
-            continue
-
-        try:
-            await guild.create_text_channel(
-                channel_name,
-                category=category,
-                reason=f"{BOT_NAME} setup"
-            )
-            created.append(f"Channel: #{channel_name}")
-        except discord.Forbidden:
-            created.append(f"Could not create channel: #{channel_name}")
-
-result = "\n".join(created[:35]) if created else "সব প্রয়োজনীয় channel ও role আগে থেকেই আছে।"
-
-await interaction.followup.send(
-    f"**Setup complete**\n{result}\n\n"
-    "নোট: STAFF category-র permissions হাতে পরীক্ষা করে নিন।",
-    ephemeral=True
-)
-
-==============================
-
-MODERATION COMMANDS
-
-==============================
-
-@bot.tree.command(name="warn", description="Warn a member")
-@app_commands.describe(member="Member to warn", reason="Reason for warning")
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def warn(
-interaction: discord.Interaction,
-member: discord.Member,
-reason: str
-):
-if member.bot or member.id == interaction.user.id:
-await respond(interaction, "এই সদস্যকে warn করা যাবে না।")
-return
-
-warnings_store[(interaction.guild_id, member.id)].append({
-    "reason": reason,
-    "moderator": interaction.user.id,
-    "time": datetime.now(timezone.utc).isoformat()
-})
-
-await respond(
-    interaction,
-    f"{member.mention}-কে warn করা হয়েছে। কারণ: {reason}"
-)
-
-await send_mod_log(
-    interaction.guild,
-    f"⚠️ {member.mention} warned by {interaction.user.mention}. Reason: {reason}"
-)
-
-@bot.tree.command(name="warnings", description="View a member's warnings")
-@app_commands.describe(member="Member to check")
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def warnings(
-interaction: discord.Interaction,
-member: discord.Member
-):
-records = warnings_store[(interaction.guild_id, member.id)]
-
-if not records:
-    await respond(interaction, f"{member.display_name}-এর কোনো সংরক্ষিত warning নেই।")
-    return
-
-lines = [
-    f"{index}. {record['reason']}"
-    for index, record in enumerate(records, start=1)
-]
-
-await respond(
-    interaction,
-    f"**{member.display_name}-এর Warnings**\n" + "\n".join(lines[:20])
-)
-
-@bot.tree.command(name="clearwarnings", description="Clear a member's warnings")
-@app_commands.describe(member="Member whose warnings should be cleared")
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def clearwarnings(
-interaction: discord.Interaction,
-member: discord.Member
-):
-warnings_store.pop((interaction.guild_id, member.id), None)
-await respond(interaction, f"{member.mention}-এর warning তালিকা পরিষ্কার করা হয়েছে।")
-
-@bot.tree.command(name="timeout", description="Temporarily timeout a member")
-@app_commands.describe(
-member="Member to timeout",
-minutes="Duration in minutes",
-reason="Reason for timeout"
-)
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.guild_only()
-async def timeout_member(
-interaction: discord.Interaction,
-member: discord.Member,
-minutes: app_commands.Range[int, 1, 10080],
-reason: str
-):
-if member.bot or member.id == interaction.user.id:
-await respond(interaction, "এই সদস্যকে timeout করা যাবে না।")
-return
-
-try:
-    await member.timeout(
-        timedelta(minutes=minutes),
-        reason=reason
-    )
     await respond(
         interaction,
-        f"{member.mention}-কে {minutes} মিনিট timeout করা হয়েছে।"
-    )
-    await send_mod_log(
-        interaction.guild,
-        f"⏱️ {member.mention} timed out by {interaction.user.mention}. Reason: {reason}"
-    )
-except discord.Forbidden:
-    await respond(interaction, "Permission নেই। Bot-এর role hierarchy ও permissions পরীক্ষা করুন।")
-except discord.HTTPException:
-    await respond(interaction, "Timeout করা যায়নি। আবার চেষ্টা করুন।")
-
-@bot.tree.command(name="kick", description="Kick a member from the server")
-@app_commands.describe(member="Member to kick", reason="Reason")
-@app_commands.checks.has_permissions(kick_members=True)
-@app_commands.guild_only()
-async def kick_member(
-interaction: discord.Interaction,
-member: discord.Member,
-reason: str
-):
-if member.bot or member.id == interaction.user.id:
-await respond(interaction, "এই সদস্যকে kick করা যাবে না।")
-return
-
-try:
-    await member.kick(reason=reason)
-    await respond(interaction, f"{member.display_name}-কে সার্ভার থেকে kick করা হয়েছে।")
-    await send_mod_log(
-        interaction.guild,
-        f"👢 {member} kicked by {interaction.user.mention}. Reason: {reason}"
-    )
-except discord.Forbidden:
-    await respond(interaction, "Permission নেই। Bot-এর role hierarchy পরীক্ষা করুন।")
-except discord.HTTPException:
-    await respond(interaction, "Kick করা যায়নি।")
-
-@bot.tree.command(name="ban", description="Ban a member from the server")
-@app_commands.describe(member="Member to ban", reason="Reason")
-@app_commands.checks.has_permissions(ban_members=True)
-@app_commands.guild_only()
-async def ban_member(
-interaction: discord.Interaction,
-member: discord.Member,
-reason: str
-):
-if member.bot or member.id == interaction.user.id:
-await respond(interaction, "এই সদস্যকে ban করা যাবে না।")
-return
-
-try:
-    await member.ban(reason=reason)
-    await respond(interaction, f"{member.display_name}-কে ban করা হয়েছে।")
-    await send_mod_log(
-        interaction.guild,
-        f"🔨 {member} banned by {interaction.user.mention}. Reason: {reason}"
-    )
-except discord.Forbidden:
-    await respond(interaction, "Permission নেই। Bot-এর role hierarchy পরীক্ষা করুন।")
-except discord.HTTPException:
-    await respond(interaction, "Ban করা যায়নি।")
-
-@bot.tree.command(name="clear", description="Delete recent messages in this channel")
-@app_commands.describe(amount="Number of messages to delete, 1–100")
-@app_commands.checks.has_permissions(manage_messages=True)
-@app_commands.guild_only()
-async def clear(
-interaction: discord.Interaction,
-amount: app_commands.Range[int, 1, 100]
-):
-channel = interaction.channel
-
-if not isinstance(channel, discord.TextChannel):
-    await respond(interaction, "এই কমান্ড শুধু text channel-এ ব্যবহার করুন।")
-    return
-
-await interaction.response.defer(ephemeral=True, thinking=True)
-
-try:
-    deleted = await channel.purge(limit=amount)
-    await interaction.followup.send(
-        f"{len(deleted)}টি message মুছে ফেলা হয়েছে।",
-        ephemeral=True
-    )
-except discord.Forbidden:
-    await interaction.followup.send(
-        "Message মুছতে permission নেই।",
+        "Setting up the server. Please wait...",
         ephemeral=True
     )
 
-==============================
+    created = []
 
-COMMAND ERROR HANDLING
+    # Public category
+    public_category = discord.utils.get(
+        guild.categories,
+        name="COMMUNITY"
+    )
 
-==============================
+    if public_category is None:
+        public_category = await guild.create_category("COMMUNITY")
+        created.append("COMMUNITY")
 
-@bot.tree.error
-async def on_app_command_error(
-interaction: discord.Interaction,
-error: app_commands.AppCommandError
+    public_channels = [
+        ("welcome", "Welcome and member updates"),
+        ("rules", "Community rules"),
+        ("announcements", "Official announcements"),
+        ("general-chat", "General community chat"),
+        ("media", "Share images and videos")
+    ]
+
+    for channel_name, topic in public_channels:
+        existing = discord.utils.get(
+            guild.text_channels,
+            name=channel_name
+        )
+
+        if existing is None:
+            await guild.create_text_channel(
+                channel_name,
+                category=public_category,
+                topic=topic
+            )
+            created.append(channel_name)
+
+    # Private staff category
+    staff_category = discord.utils.get(
+        guild.categories,
+        name="STAFF"
+    )
+
+    if staff_category is None:
+        bot_member = guild.me
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False
+            )
+        }
+
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True
+            )
+
+        staff_category = await guild.create_category(
+            "STAFF",
+            overwrites=overwrites
+        )
+        created.append("STAFF")
+
+    staff_log = discord.utils.get(
+        guild.text_channels,
+        name="mod-logs"
+    )
+
+    if staff_log is None:
+        await guild.create_text_channel(
+            "mod-logs",
+            category=staff_category,
+            topic="Moderation logs"
+        )
+        created.append("mod-logs")
+
+    result = (
+        "Setup completed.\n\n"
+        + (
+            "**Created:** " + ", ".join(created)
+            if created
+            else "All requested channels already existed."
+        )
+        + "\n\n**Important:** Check STAFF category permissions "
+          "and grant access only to trusted moderators."
+    )
+
+    await interaction.followup.send(result, ephemeral=True)
+
+
+# ==========================================
+# WARNING COMMANDS
+# ==========================================
+
+@bot.tree.command(name="warn", description="Warn a server member")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
 ):
-if isinstance(error, app_commands.MissingPermissions):
-message = "এই কমান্ড ব্যবহারের permission আপনার নেই।"
-elif isinstance(error, app_commands.CheckFailure):
-message = str(error) or "এই কমান্ড ব্যবহার করার অনুমতি নেই।"
-else:
-print(f"Command error: {error}")
-message = "কমান্ড চালাতে সমস্যা হয়েছে। Bot logs পরীক্ষা করুন।"
+    if not bot_can_moderate(interaction.user, member):
+        await respond(
+            interaction,
+            "You cannot warn this member because of their role or status."
+        )
+        return
 
-try:
-    await respond(interaction, message)
-except discord.HTTPException:
-    pass
+    entry = {
+        "reason": reason,
+        "moderator": interaction.user.id,
+        "time": datetime.now(timezone.utc).isoformat()
+    }
 
-==============================
+    warnings_db[(interaction.guild.id, member.id)].append(entry)
 
-START
+    embed = make_embed(
+        "Member Warned",
+        f"**Member:** {member.mention}\n"
+        f"**Moderator:** {interaction.user.mention}\n"
+        f"**Reason:** {reason}\n"
+        f"**Total warnings:** "
+        f"{len(warnings_db[(interaction.guild.id, member.id)])}",
+        discord.Color.orange()
+    )
 
-==============================
+    await respond(interaction, embed=embed)
 
-if name == "main":
-if not TOKEN:
-raise RuntimeError(
-"DISCORD_TOKEN সেট করা নেই। Render Environment Variables-এ সেট করুন।"
+
+@bot.tree.command(name="warnings", description="View a member's warnings")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warnings(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    entries = warnings_db.get(
+        (interaction.guild.id, member.id),
+        []
+    )
+
+    if not entries:
+        await respond(interaction, f"{member.mention} has no recorded warnings.")
+        return
+
+    lines = []
+
+    for number, entry in enumerate(entries[-10:], start=1):
+        lines.append(
+            f"**{number}.** {entry['reason']}\n"
+            f"Moderator ID: `{entry['moderator']}`"
+        )
+
+    embed = make_embed(
+        f"Warnings: {member}",
+        "\n\n".join(lines),
+        discord.Color.orange()
+    )
+
+    await respond(interaction, embed=embed)
+
+
+@bot.tree.command(
+    name="clearwarnings",
+    description="Clear a member's recorded warnings"
 )
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def clearwarnings(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    key = (interaction.guild.id, member.id)
+    previous = len(warnings_db.get(key, []))
+    warnings_db.pop(key, None)
 
-Thread(target=run_web_server, daemon=True).start()
-bot.run(TOKEN)
+    await respond(
+        interaction,
+        f"Cleared {previous} warning(s) for {member.mention}."
+    )
+
+
+# ==========================================
+# TIMEOUT COMMAND
+# ==========================================
+
+@bot.tree.command(name="timeout", description="Timeout a member")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided"
+):
+    if not bot_can_moderate(interaction.user, member):
+        await respond(interaction, "You cannot timeout this member.")
+        return
+
+    if not interaction.guild.me.guild_permissions.moderate_members:
+        await respond(interaction, "I need the Moderate Members permission.")
+        return
+
+    try:
+        await member.timeout(
+            timedelta(minutes=minutes),
+            reason=f"{reason} | Moderator: {interaction.user}"
+        )
+        await respond(
+            interaction,
+            f"{member.mention} was timed out for {minutes} minute(s).\n"
+            f"Reason: {reason}"
+        )
+    except discord.HTTPException as error:
+        print(f"Timeout error: {error}")
+        await respond(interaction, "Could not timeout that member.")
+
+
+# ==========================================
+# KICK COMMAND
+# ==========================================
+
+@bot.tree.command(name="kick", description="Kick a server member")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
+    if not bot_can_moderate(interaction.user, member):
+        await respond(interaction, "You cannot kick this member.")
+        return
+
+    if not interaction.guild.me.guild_permissions.kick_members:
+        await respond(interaction, "I need the Kick Members permission.")
+        return
+
+    try:
+        await member.kick(
+            reason=f"{reason} | Moderator: {interaction.user}"
+        )
+        await respond(
+            interaction,
+            f"**{member}** was kicked.\nReason: {reason}"
+        )
+    except discord.HTTPException as error:
+        print(f"Kick error: {error}")
+        await respond(interaction, "Could not kick that member.")
+
+
+# ==========================================
+# BAN COMMAND
+# ==========================================
+
+@bot.tree.command(name="ban", description="Ban a server member")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
+    if not bot_can_moderate(interaction.user, member):
+        await respond(interaction, "You cannot ban this member.")
+        return
+
+    if not interaction.guild.me.guild_permissions.ban_members:
+        await respond(interaction, "I need the Ban Members permission.")
+        return
+
+    try:
+        await member.ban(
+            reason=f"{reason} | Moderator: {interaction.user}"
+        )
+        await respond(
+            interaction,
+            f"**{member}** was banned.\nReason: {reason}"
+        )
+    except discord.HTTPException as error:
+        print(f"Ban error: {error}")
+        await respond(interaction, "Could not ban that member.")
+
+
+# ==========================================
+# CLEAR MESSAGES COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="clear",
+    description="Delete recent messages from this channel"
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clear(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 100]
+):
+    channel = interaction.channel
+
+    if not isinstance(channel, discord.TextChannel):
+        await respond(interaction, "Use this command in a text channel.")
+        return
+
+    if not interaction.guild.me.guild_permissions.manage_messages:
+        await respond(interaction, "I need the Manage Messages permission.")
+        return
+
+    await respond(
+        interaction,
+        f"Deleting up to {amount} messages...",
+        ephemeral=True
+    )
+
+    try:
+        deleted = await channel.purge(limit=amount)
+        await interaction.followup.send(
+            f"Deleted {len(deleted)} message(s).",
+            ephemeral=True
+        )
+    except discord.HTTPException as error:
+        print(f"Clear error: {error}")
+        await interaction.followup.send(
+            "Could not delete messages.",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# START BOT
+# ==========================================
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing. Set it in Render Environment Variables."
+        )
+
+    Thread(
+        target=run_web_server,
+        daemon=True
+    ).start()
+
+    bot.run(TOKEN, log_handler=None)
